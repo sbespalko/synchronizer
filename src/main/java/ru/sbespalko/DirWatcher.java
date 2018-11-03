@@ -18,7 +18,11 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import static java.nio.file.LinkOption.NOFOLLOW_LINKS;
 import static java.nio.file.StandardWatchEventKinds.ENTRY_CREATE;
@@ -33,11 +37,15 @@ import static java.nio.file.StandardWatchEventKinds.OVERFLOW;
 public class DirWatcher {
   private static final Logger log = LogManager.getLogger();
 
-  private final Map<Path, Path> pathsMap;
+  private final ScheduledThreadPoolExecutor executor;
   private final WatchService watcher;
+  private EventHandler eventHandler;
+  private PathDispatcher pathDispatcher;
+  private ConcurrentMap<Path, Future<?>> planner;
+  private long startDelay = 10000L;
+
   private final Map<WatchKey, Path> keys;
   private final boolean recursive;
-  private EventHandler eventHandler;
   private boolean trace;
 
   @SuppressWarnings("unchecked")
@@ -45,12 +53,12 @@ public class DirWatcher {
     return (WatchEvent<T>) event;
   }
 
-  public EventHandler getEventHandler() {
-    return eventHandler;
-  }
-
   public void setEventHandler(EventHandler eventHandler) {
     this.eventHandler = eventHandler;
+  }
+
+  public void setPathDispatcher(PathDispatcher pathDispatcher) {
+    this.pathDispatcher = pathDispatcher;
   }
 
   /**
@@ -91,7 +99,11 @@ public class DirWatcher {
    * Creates a WatchService and registers the given directory
    */
   public DirWatcher(Map<Path, Path> pathsMap, boolean recursive) throws IOException {
-    this.pathsMap = pathsMap;
+    executor = new ScheduledThreadPoolExecutor(10);
+    executor.setRemoveOnCancelPolicy(true);
+
+    planner = new ConcurrentHashMap<>();
+
     this.watcher = FileSystems.getDefault()
                               .newWatchService();
     this.keys = new HashMap<WatchKey, Path>();
@@ -114,6 +126,7 @@ public class DirWatcher {
 
     // enable trace after initial registration
     this.trace = true;
+
   }
 
   /**
@@ -150,23 +163,31 @@ public class DirWatcher {
         Path path = dir.resolve(name);
 
         // print out event
-        Path symmetricPath = getSymmetricPath(dir).resolve(name);
-        CompletableFuture.runAsync(() -> {
-          try {
-            eventHandler.processEvent(path, symmetricPath, ev.kind()
-                                                             .name());
-          } catch (IOException e) {
-            resync(path, symmetricPath);
+        Path symmetricPath = pathDispatcher.getSymmetricPath(dir)
+                                           .resolve(name);
+        planner.compute(symmetricPath, (k, future) -> {
+          if (future != null) {
+            future.cancel(true);
           }
+          return executor.schedule(() -> {
+            try {
+              eventHandler.processEvent(path, symmetricPath, ev.kind()
+                                                               .name());
+            } catch (IOException e) {
+              log.error("IOEXCEPTION: {}", e.getMessage());
+              resync(path, symmetricPath);
+            }
+          }, startDelay, TimeUnit.MILLISECONDS);
         });
         log.debug("{}: {}", event.kind()
-                                           .name(), path);
+                                 .name(), path);
 
         // if directory is created, and watching recursively, then
         // register it and its sub-directories
         if (recursive && (kind == ENTRY_CREATE)) {
           try {
             if (Files.isDirectory(path, NOFOLLOW_LINKS)) {
+              pathDispatcher.registerPaths(path);
               registerDirTree(path);
             }
           } catch (IOException x) {
@@ -178,8 +199,8 @@ public class DirWatcher {
       // reset key and remove from set if directory no longer accessible
       boolean valid = key.reset();
       if (!valid) {
-        keys.remove(key);
-
+        Path path = keys.remove(key);
+        pathDispatcher.unregisterPaths(path);
         // all directories are inaccessible
         if (keys.isEmpty()) {
           break;
@@ -188,7 +209,7 @@ public class DirWatcher {
     }
   }
 
-  private void resync(Path path, Path symmetricPath) {
+  private synchronized void resync(Path path, Path symmetricPath) {
     try {
       if (Files.exists(path) && !Files.exists(symmetricPath)) {
         eventHandler.processEvent(path, symmetricPath, ENTRY_CREATE.name());
@@ -218,27 +239,12 @@ public class DirWatcher {
         }
       }
     } catch (IOException e) {
-      e.printStackTrace();
-      resync(path, symmetricPath);
-    }
-  }
-
-  private Path getSymmetricPath(Path path) {
-    //проверять изменения на другой стороне на идентичность файлов/папок, чтобы не попасть в цикл
-    Path symmetricDir = pathsMap.get(path);
-    if (symmetricDir == null) {
-      for (Map.Entry<Path, Path> entry : pathsMap.entrySet()) {
-        if (path.equals(entry.getValue())) {
-          symmetricDir = entry.getKey();
-          break;
-        }
+      try {
+        Thread.sleep(startDelay);
+        resync(path, symmetricPath);
+      } catch (InterruptedException e1) {
+        log.error("Interrupt: {}", e.getMessage());
       }
     }
-    if (symmetricDir == null) {
-      throw new RuntimeException("not found symmetry");
-    }
-    return symmetricDir;
   }
-
-
 }

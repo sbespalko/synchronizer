@@ -26,6 +26,7 @@ public class Synchronizer {
                                              e -> Paths.get((String) e.getValue())));
 
     DirWatcher dirWatcher = new DirWatcher(pathsMap, true);
+    dirWatcher.setPathDispatcher(new PathDispatcher(pathsMap, true));
     dirWatcher.setEventHandler(new EventHandler());
     dirWatcher.start();
   }

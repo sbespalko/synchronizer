@@ -1,6 +1,8 @@
 package ru.sbespalko;
 
 import org.apache.commons.io.FileUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.File;
 import java.io.IOException;
@@ -12,9 +14,10 @@ import java.util.Comparator;
 import static java.nio.file.StandardCopyOption.COPY_ATTRIBUTES;
 
 public class EventHandler {
-  public static final String CREATE = "ENTRY_CREATE";
-  public static final String DELETE = "ENTRY_DELETE";
-  public static final String MODIFY = "ENTRY_MODIFY";
+  private static final Logger log = LogManager.getLogger();
+  private static final String CREATE = "ENTRY_CREATE";
+  private static final String DELETE = "ENTRY_DELETE";
+  private static final String MODIFY = "ENTRY_MODIFY";
 
   public void processEvent(Path path, Path symmetricPath, String kindName) throws IOException {
     switch (kindName) {
@@ -27,24 +30,31 @@ public class EventHandler {
       case MODIFY:
         handleModify(path, symmetricPath);
         break;
-      default: throw new IllegalArgumentException("NOT EXIST: " + kindName);
+      default:
+        throw new IllegalArgumentException("NOT EXIST: " + kindName);
     }
   }
 
-  private synchronized void handleCreate(Path path, Path symmetricPath) throws IOException {
+  private void handleCreate(Path path, Path symmetricPath) throws IOException {
     if (Files.exists(symmetricPath)) {
       return;
     }
     if (Files.isDirectory(path)) {
-      Files.createDirectory(symmetricPath);
+      Files.createDirectories(symmetricPath);
+      log.info("Create dir {}: ", symmetricPath);
     } else {
       if (Files.exists(path)) {
+        if (!Files.exists(symmetricPath.getParent())) {
+          Files.createDirectories(symmetricPath.getParent());
+          log.info("Create dirs: {}", symmetricPath.getParent());
+        }
         Files.copy(path, symmetricPath, COPY_ATTRIBUTES);
+        log.info("Create file: {}", symmetricPath);
       }
     }
   }
 
-  private synchronized void handleDelete(Path path, Path symmetricPath) throws IOException {
+  private void handleDelete(Path path, Path symmetricPath) throws IOException {
     if (!Files.exists(symmetricPath)) {
       return;
     }
@@ -53,18 +63,29 @@ public class EventHandler {
            .sorted(Comparator.reverseOrder())
            .map(Path::toFile)
            .forEach(File::delete);
+      log.info("Delete tree from: {}", symmetricPath);
     } else {
-      Files.delete(symmetricPath);
+      if (!Files.exists(path)) {
+        Files.delete(symmetricPath);
+        log.info("Delete file: {}", symmetricPath);
+      }
     }
   }
 
-  private synchronized void handleModify(Path path, Path symmetricPath) throws IOException {
-    if (FileUtils.contentEquals(path.toFile(), symmetricPath.toFile())) {
-      return;
-    }
+  private void handleModify(Path path, Path symmetricPath) throws IOException {
     if (Files.exists(path)) {
+      if (Files.isDirectory(path)) {
+        return;
+      }
+      if (FileUtils.contentEquals(path.toFile(), symmetricPath.toFile())) {
+        return;
+      }
+      if (!Files.exists(symmetricPath.getParent())) {
+        handleCreate(path, symmetricPath);
+      }
       try (OutputStream outputStream = Files.newOutputStream(symmetricPath)) {
         Files.copy(path, outputStream);
+        log.info("Copy files: {} -> {}", path, symmetricPath);
       }
     }
   }
